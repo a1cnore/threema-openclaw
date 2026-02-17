@@ -61,6 +61,15 @@ type ThreemaFeaturesConfig = {
       minCharsDelta?: number;
     };
   };
+  processReflectedOutgoing?: {
+    enabled?: boolean;
+    allowedChatIds?: string[];
+  };
+  startupReplayGuard?: {
+    enabled?: boolean;
+    requireReflectionQueueDry?: boolean;
+    maxWarmupMs?: number;
+  };
 };
 
 type ResolvedThreemaAccount = {
@@ -154,6 +163,69 @@ function resolveGroupEvolvingPartialStreamingOptions(
   };
 }
 
+function resolveProcessReflectedOutgoingConfig(
+  cfg: OpenClawConfig,
+  accountId: string,
+): ProcessReflectedOutgoingSettings {
+  const threemaConfig = getThreemaConfig(cfg);
+  const channelCfg = threemaConfig?.features?.processReflectedOutgoing ?? {};
+  const accountCfg = getAccountsConfig(cfg)?.[accountId]?.features?.processReflectedOutgoing ?? {};
+  const merged = {
+    ...channelCfg,
+    ...accountCfg,
+  };
+
+  const enabled = typeof merged.enabled === "boolean" ? merged.enabled : false;
+  const rawAllowedChatIds = Array.isArray(merged.allowedChatIds) ? merged.allowedChatIds : [];
+  const dedupedAllowed = new Set<string>();
+  for (const entry of rawAllowedChatIds) {
+    if (typeof entry !== "string") {
+      continue;
+    }
+    const normalized = normalizeThreemaChatIdForAllowlist(entry);
+    if (!normalized) {
+      continue;
+    }
+    dedupedAllowed.add(normalized);
+  }
+
+  return {
+    enabled,
+    allowedChatIds: Array.from(dedupedAllowed),
+  };
+}
+
+function resolveStartupReplayGuardConfig(
+  cfg: OpenClawConfig,
+  accountId: string,
+): StartupReplayGuardSettings {
+  const threemaConfig = getThreemaConfig(cfg);
+  const channelCfg = threemaConfig?.features?.startupReplayGuard ?? {};
+  const accountCfg = getAccountsConfig(cfg)?.[accountId]?.features?.startupReplayGuard ?? {};
+  const merged = {
+    ...channelCfg,
+    ...accountCfg,
+  };
+
+  const enabled = typeof merged.enabled === "boolean" ? merged.enabled : true;
+  const requireReflectionQueueDry = typeof merged.requireReflectionQueueDry === "boolean"
+    ? merged.requireReflectionQueueDry
+    : true;
+  const maxWarmupMs = (
+    typeof merged.maxWarmupMs === "number"
+    && Number.isFinite(merged.maxWarmupMs)
+    && merged.maxWarmupMs >= 0
+  )
+    ? Math.floor(merged.maxWarmupMs)
+    : DEFAULT_STARTUP_REPLAY_GUARD_MAX_WARMUP_MS;
+
+  return {
+    enabled,
+    requireReflectionQueueDry,
+    maxWarmupMs,
+  };
+}
+
 function resolveThreemaAccount(params: {
   cfg: OpenClawConfig;
   accountId?: string | null;
@@ -191,9 +263,41 @@ function resolveThreemaAccount(params: {
 
 const activeClients = new Map<string, MediatorClient>();
 
-// Track message IDs we've sent to avoid echo loops
-const sentMessageIds = new Set<string>();
-const MAX_SENT_TRACKING = 1000;
+type StartupReplayGuardSettings = {
+  enabled: boolean;
+  requireReflectionQueueDry: boolean;
+  maxWarmupMs: number;
+};
+
+type ProcessReflectedOutgoingSettings = {
+  enabled: boolean;
+  allowedChatIds: string[];
+};
+
+type AccountInboundGuardState = {
+  connectedAtMs: number;
+  warmupDeadlineMs: number;
+  reflectionQueueDry: boolean;
+  settings: StartupReplayGuardSettings;
+  directReplyCspWarningIssued: boolean;
+  queueDryTimeoutWarningIssued: boolean;
+};
+
+type SentMessageDedupeState = {
+  dataDir: string;
+  loaded: boolean;
+  keys: Set<string>;
+  order: string[];
+  dirtyAdds: number;
+};
+
+const accountInboundGuardStates = new Map<string, AccountInboundGuardState>();
+const sentMessageDedupeStates = new Map<string, SentMessageDedupeState>();
+
+// Track message IDs we've sent (persisted per account) to avoid echo loops.
+const MAX_SENT_TRACKING = 4_096;
+const SENT_MESSAGE_DEDUPE_STATE_FILE = "sent-message-dedupe.json";
+const SENT_MESSAGE_DEDUPE_PERSIST_EVERY = 1;
 const THREEMA_TEXT_MESSAGE_TYPE = 0x01;
 const THREEMA_FILE_MESSAGE_TYPE = 0x17;
 const THREEMA_GROUP_TEXT_MESSAGE_TYPE = 0x41;
@@ -212,6 +316,7 @@ const MEDIA_STORAGE_SUBDIR = "media";
 const DEFAULT_VOICE_REPLY_MAX_TEXT_CHARS = 6_000;
 const observedGroupMemberIdentities = new Map<string, Set<string>>();
 const GROUP_EVOLVING_REPLY_SESSION_TTL_MS = 15 * 60_000;
+const DEFAULT_STARTUP_REPLAY_GUARD_MAX_WARMUP_MS = 120_000;
 
 type GroupEvolvingReplySession = {
   anchorMessageId: bigint;
@@ -520,13 +625,292 @@ function resolveGroupEvolvingReplyText(params: {
   return trimmedNext;
 }
 
-function trackSentMessage(id: string) {
-  sentMessageIds.add(id);
-  // Prune old entries
-  if (sentMessageIds.size > MAX_SENT_TRACKING) {
-    const first = sentMessageIds.values().next().value;
-    if (first) sentMessageIds.delete(first);
+function normalizeAccountDataDir(dataDir: string | undefined | null): string {
+  if (typeof dataDir !== "string") {
+    return "";
   }
+  const trimmed = dataDir.trim();
+  if (!trimmed) {
+    return "";
+  }
+  return path.resolve(trimmed);
+}
+
+function getOrCreateSentMessageDedupeState(accountId: string, dataDir: string): SentMessageDedupeState {
+  const resolvedDataDir = normalizeAccountDataDir(dataDir);
+  const existing = sentMessageDedupeStates.get(accountId);
+  if (existing && existing.dataDir === resolvedDataDir) {
+    return existing;
+  }
+  const state: SentMessageDedupeState = {
+    dataDir: resolvedDataDir,
+    loaded: false,
+    keys: new Set<string>(),
+    order: [],
+    dirtyAdds: 0,
+  };
+  sentMessageDedupeStates.set(accountId, state);
+  return state;
+}
+
+function rememberSentMessageKey(state: SentMessageDedupeState, key: string): void {
+  if (state.keys.has(key)) {
+    return;
+  }
+  state.keys.add(key);
+  state.order.push(key);
+  if (state.order.length > MAX_SENT_TRACKING) {
+    const oldest = state.order.shift();
+    if (oldest) {
+      state.keys.delete(oldest);
+    }
+  }
+}
+
+function loadSentMessageDedupeStateIfNeeded(params: {
+  accountId: string;
+  state: SentMessageDedupeState;
+  ctx?: any;
+}): void {
+  const { accountId, state, ctx } = params;
+  if (state.loaded || !state.dataDir) {
+    state.loaded = true;
+    return;
+  }
+  state.loaded = true;
+  const dedupePath = path.join(state.dataDir, SENT_MESSAGE_DEDUPE_STATE_FILE);
+  try {
+    if (!fs.existsSync(dedupePath)) {
+      return;
+    }
+    const raw = fs.readFileSync(dedupePath, "utf-8").trim();
+    if (!raw) {
+      return;
+    }
+    const parsed = JSON.parse(raw) as unknown;
+    const keys = Array.isArray(parsed)
+      ? parsed
+      : (parsed && typeof parsed === "object" && Array.isArray((parsed as any).keys))
+        ? (parsed as any).keys
+        : [];
+    for (const candidate of keys) {
+      if (typeof candidate !== "string") {
+        continue;
+      }
+      const key = candidate.trim();
+      if (!key) {
+        continue;
+      }
+      rememberSentMessageKey(state, key);
+    }
+    if (state.order.length > 0) {
+      ctx?.log?.debug?.(
+        `[${accountId}] Loaded ${state.order.length} sent-message dedupe key(s) from disk`,
+      );
+    }
+  } catch (err) {
+    ctx?.log?.warn?.(
+      `[${accountId}] Failed loading sent-message dedupe state: ${String(err)}`,
+    );
+  }
+}
+
+function persistSentMessageDedupeState(params: {
+  accountId: string;
+  state: SentMessageDedupeState;
+  force?: boolean;
+  ctx?: any;
+}): void {
+  const { accountId, state, force = false, ctx } = params;
+  if (!state.dataDir) {
+    return;
+  }
+  if (!force && state.dirtyAdds < SENT_MESSAGE_DEDUPE_PERSIST_EVERY) {
+    return;
+  }
+  const dedupePath = path.join(state.dataDir, SENT_MESSAGE_DEDUPE_STATE_FILE);
+  try {
+    fs.mkdirSync(state.dataDir, { recursive: true });
+    const payload = {
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      keys: state.order.slice(-MAX_SENT_TRACKING),
+    };
+    fs.writeFileSync(dedupePath, JSON.stringify(payload, null, 2) + "\n");
+    state.dirtyAdds = 0;
+  } catch (err) {
+    ctx?.log?.warn?.(
+      `[${accountId}] Failed persisting sent-message dedupe state: ${String(err)}`,
+    );
+  }
+}
+
+function trackSentMessage(id: string, options?: { accountId?: string; dataDir?: string; ctx?: any }): void {
+  const key = id.trim();
+  if (!key) {
+    return;
+  }
+  const accountId = options?.accountId ?? DEFAULT_ACCOUNT_ID;
+  const dataDir = options?.dataDir ?? activeClients.get(accountId)?.getDataDir() ?? "";
+  const state = getOrCreateSentMessageDedupeState(accountId, dataDir);
+  loadSentMessageDedupeStateIfNeeded({
+    accountId,
+    state,
+    ctx: options?.ctx,
+  });
+  if (state.keys.has(key)) {
+    return;
+  }
+  rememberSentMessageKey(state, key);
+  state.dirtyAdds += 1;
+  persistSentMessageDedupeState({
+    accountId,
+    state,
+    ctx: options?.ctx,
+  });
+}
+
+function hasTrackedSentMessage(id: string, options?: { accountId?: string; dataDir?: string; ctx?: any }): boolean {
+  const key = id.trim();
+  if (!key) {
+    return false;
+  }
+  const accountId = options?.accountId ?? DEFAULT_ACCOUNT_ID;
+  const dataDir = options?.dataDir ?? activeClients.get(accountId)?.getDataDir() ?? "";
+  const state = getOrCreateSentMessageDedupeState(accountId, dataDir);
+  loadSentMessageDedupeStateIfNeeded({
+    accountId,
+    state,
+    ctx: options?.ctx,
+  });
+  return state.keys.has(key);
+}
+
+function flushSentMessageDedupeState(accountId: string, ctx?: any): void {
+  const state = sentMessageDedupeStates.get(accountId);
+  if (!state) {
+    return;
+  }
+  persistSentMessageDedupeState({
+    accountId,
+    state,
+    force: true,
+    ctx,
+  });
+}
+
+function syncAccountInboundGuardSettings(params: {
+  accountId: string;
+  cfg: OpenClawConfig;
+}): AccountInboundGuardState {
+  const settings = resolveStartupReplayGuardConfig(params.cfg, params.accountId);
+  const existing = accountInboundGuardStates.get(params.accountId);
+  if (!existing) {
+    const now = Date.now();
+    const created: AccountInboundGuardState = {
+      connectedAtMs: now,
+      warmupDeadlineMs: now + settings.maxWarmupMs,
+      reflectionQueueDry: false,
+      settings,
+      directReplyCspWarningIssued: false,
+      queueDryTimeoutWarningIssued: false,
+    };
+    accountInboundGuardStates.set(params.accountId, created);
+    return created;
+  }
+
+  existing.settings = settings;
+  existing.warmupDeadlineMs = existing.connectedAtMs + settings.maxWarmupMs;
+  return existing;
+}
+
+function beginAccountInboundGuardWindow(params: {
+  accountId: string;
+  cfg: OpenClawConfig;
+}): AccountInboundGuardState {
+  const settings = resolveStartupReplayGuardConfig(params.cfg, params.accountId);
+  const now = Date.now();
+  const state: AccountInboundGuardState = {
+    connectedAtMs: now,
+    warmupDeadlineMs: now + settings.maxWarmupMs,
+    reflectionQueueDry: false,
+    settings,
+    directReplyCspWarningIssued: false,
+    queueDryTimeoutWarningIssued: false,
+  };
+  accountInboundGuardStates.set(params.accountId, state);
+  return state;
+}
+
+function markAccountReflectionQueueDry(accountId: string): void {
+  const state = accountInboundGuardStates.get(accountId);
+  if (!state) {
+    return;
+  }
+  state.reflectionQueueDry = true;
+}
+
+function shouldForwardInboundToAgent(params: {
+  accountId: string;
+  cfg: OpenClawConfig;
+  chatId: string;
+  messageId: string;
+  source: string;
+  ctx: any;
+}): boolean {
+  const state = syncAccountInboundGuardSettings({
+    accountId: params.accountId,
+    cfg: params.cfg,
+  });
+  const settings = state.settings;
+  if (!settings.enabled) {
+    return true;
+  }
+
+  if (state.reflectionQueueDry) {
+    return true;
+  }
+
+  const now = Date.now();
+  if (now >= state.warmupDeadlineMs) {
+    if (settings.requireReflectionQueueDry && !state.queueDryTimeoutWarningIssued) {
+      state.queueDryTimeoutWarningIssued = true;
+      params.ctx.log?.warn?.(
+        `[${params.accountId}] Startup replay guard warmup expired without ReflectionQueueDry; resuming inbound processing`,
+      );
+    }
+    return true;
+  }
+
+  const remainingMs = Math.max(0, state.warmupDeadlineMs - now);
+  params.ctx.log?.debug?.(
+    `[${params.accountId}] Startup replay guard skipped ${params.source} ${params.chatId}#${params.messageId} (waiting for ReflectionQueueDry, ${remainingMs}ms remaining)`,
+  );
+  return false;
+}
+
+function shouldBlockDirectAutoReplyDueToCsp(params: {
+  accountId: string;
+  cfg: OpenClawConfig;
+  client: MediatorClient;
+  chatId: string;
+  ctx: any;
+}): boolean {
+  if (params.client.isLeader() && params.client.isCspReady()) {
+    return false;
+  }
+
+  const state = syncAccountInboundGuardSettings({
+    accountId: params.accountId,
+    cfg: params.cfg,
+  });
+  if (!state.directReplyCspWarningIssued) {
+    state.directReplyCspWarningIssued = true;
+    params.ctx.log?.warn?.(
+      `[${params.accountId}] Skipping direct auto-reply for ${params.chatId}: CSP not ready (leader=${params.client.isLeader()}, cspReady=${params.client.isCspReady()})`,
+    );
+  }
+  return true;
 }
 
 function tryNormalizeIdentity(value: string): string | null {
@@ -991,6 +1375,61 @@ function parseThreemaChatTarget(raw: string): ParsedThreemaChatTarget | null {
   const rawOpenClawGroupMatch = trimmed.match(/^g-group-([*0-9a-z]{8})-([0-9]+)$/i);
   if (rawOpenClawGroupMatch) {
     return buildGroupTarget(rawOpenClawGroupMatch[1] ?? "", rawOpenClawGroupMatch[2] ?? "");
+  }
+
+  return null;
+}
+
+function normalizeThreemaChatIdForAllowlist(raw: string): string | null {
+  const parsed = parseThreemaChatTarget(raw);
+  if (parsed) {
+    return parsed.chatId;
+  }
+  const maybeIdentity = tryNormalizeIdentity(raw);
+  if (maybeIdentity) {
+    return `threema:${maybeIdentity}`;
+  }
+  return null;
+}
+
+function resolveOutgoingMessageChatId(params: {
+  msg: any;
+  account: ResolvedThreemaAccount;
+}): string | null {
+  const msg = params.msg as Record<string, unknown>;
+  const conversation = toRecord(msg.conversation);
+  const contactIdentity = tryNormalizeIdentity(String(conversation?.contact ?? ""));
+  if (contactIdentity) {
+    return `threema:${contactIdentity}`;
+  }
+
+  const group = toRecord(conversation?.group);
+  const creatorIdentity = tryNormalizeIdentity(
+    String(group?.creatorIdentity ?? params.account.identity?.identity ?? ""),
+  );
+  const groupId = parseGroupId(group?.groupId);
+  if (creatorIdentity && groupId !== null) {
+    return `threema:group:${creatorIdentity}/${groupId.toString()}`;
+  }
+
+  const body = toUint8Array(msg.body);
+  if (
+    body
+    && body.length >= 16
+    && (
+      msg.type === THREEMA_GROUP_TEXT_MESSAGE_TYPE
+      || msg.type === THREEMA_GROUP_FILE_MESSAGE_TYPE
+      || msg.type === THREEMA_GROUP_REACTION_MESSAGE_TYPE_INTERNAL
+      || msg.type === THREEMA_LEGACY_GROUP_DELIVERY_RECEIPT_MESSAGE_TYPE
+      || msg.type === THREEMA_GROUP_NAME_MESSAGE_TYPE
+    )
+  ) {
+    const parsedCreator = tryNormalizeIdentity(new TextDecoder().decode(body.slice(0, 8)));
+    if (!parsedCreator) {
+      return null;
+    }
+    const parsedGroupId = new DataView(body.buffer, body.byteOffset + 8, 8).getBigUint64(0, true);
+    return `threema:group:${parsedCreator}/${parsedGroupId.toString()}`;
   }
 
   return null;
@@ -2131,7 +2570,11 @@ async function handleGroupCommand(params: {
       senderIdentity,
       "Usage: /group <group-name>",
     );
-    trackSentMessage(usageId.toString());
+    trackSentMessage(usageId.toString(), {
+      accountId: params.account.accountId,
+      dataDir: params.account.dataDir,
+      ctx: params.ctx,
+    });
     return true;
   }
 
@@ -2174,7 +2617,11 @@ async function handleGroupCommand(params: {
       bootstrapText,
       { requireCsp: true },
     );
-    trackSentMessage(bootstrapMessageId.toString());
+    trackSentMessage(bootstrapMessageId.toString(), {
+      accountId: params.account.accountId,
+      dataDir: params.account.dataDir,
+      ctx: params.ctx,
+    });
 
     const directConfirmation = [
       `Created group "${command.name}" and invited you.`,
@@ -2182,7 +2629,11 @@ async function handleGroupCommand(params: {
       "A bootstrap message has been posted there so it is a distinct session.",
     ].join("\n");
     const confirmationId = await client.sendTextMessage(senderIdentity, directConfirmation);
-    trackSentMessage(confirmationId.toString());
+    trackSentMessage(confirmationId.toString(), {
+      accountId: params.account.accountId,
+      dataDir: params.account.dataDir,
+      ctx: params.ctx,
+    });
 
     params.ctx.log?.info?.(
       `[${params.account.accountId}] /group created ${groupChatId} for ${senderIdentity}`,
@@ -2198,7 +2649,11 @@ async function handleGroupCommand(params: {
         senderIdentity,
         `Failed to create group "${command.name}": ${message}`,
       );
-      trackSentMessage(failureId.toString());
+      trackSentMessage(failureId.toString(), {
+        accountId: params.account.accountId,
+        dataDir: params.account.dataDir,
+        ctx: params.ctx,
+      });
     } catch {}
   }
 
@@ -2553,7 +3008,10 @@ export const threemaPlugin: ChannelPlugin<ResolvedThreemaAccount> = {
                 );
 
             if (result.messageId !== undefined) {
-              trackSentMessage(result.messageId.toString());
+              trackSentMessage(result.messageId.toString(), {
+                accountId: DEFAULT_ACCOUNT_ID,
+                dataDir: client.getDataDir(),
+              });
             }
 
             if (result.sent) {
@@ -2650,6 +3108,10 @@ export const threemaPlugin: ChannelPlugin<ResolvedThreemaAccount> = {
           text,
           { requireCsp: true },
         );
+        trackSentMessage(messageId.toString(), {
+          accountId: aid,
+          dataDir: client.getDataDir(),
+        });
         return {
           channel: "threema" as any,
           messageId: messageId.toString(),
@@ -2667,6 +3129,10 @@ export const threemaPlugin: ChannelPlugin<ResolvedThreemaAccount> = {
 
       // 1:1 message
       const messageId = await client.sendTextMessage(directRecipient, text);
+      trackSentMessage(messageId.toString(), {
+        accountId: aid,
+        dataDir: client.getDataDir(),
+      });
       return {
         channel: "threema" as any,
         messageId: messageId.toString(),
@@ -2741,6 +3207,17 @@ export const threemaPlugin: ChannelPlugin<ResolvedThreemaAccount> = {
           try {
             ctx.log?.info(`[${account.accountId}] Reconnecting...`);
             await client.connect();
+            const cfg = runtime.config.loadConfig();
+            beginAccountInboundGuardWindow({
+              accountId: account.accountId,
+              cfg,
+            });
+            const sentState = getOrCreateSentMessageDedupeState(account.accountId, account.dataDir);
+            loadSentMessageDedupeStateIfNeeded({
+              accountId: account.accountId,
+              state: sentState,
+              ctx,
+            });
 
             if (stopped) {
               client.disconnect();
@@ -2768,6 +3245,17 @@ export const threemaPlugin: ChannelPlugin<ResolvedThreemaAccount> = {
 
       try {
         await client.connect();
+        const cfg = runtime.config.loadConfig();
+        beginAccountInboundGuardWindow({
+          accountId: account.accountId,
+          cfg,
+        });
+        const sentState = getOrCreateSentMessageDedupeState(account.accountId, account.dataDir);
+        loadSentMessageDedupeStateIfNeeded({
+          accountId: account.accountId,
+          state: sentState,
+          ctx,
+        });
         activeClients.set(account.accountId, client);
         ctx.setStatus({
           ...ctx.getStatus(),
@@ -2811,6 +3299,11 @@ export const threemaPlugin: ChannelPlugin<ResolvedThreemaAccount> = {
         ctx.log?.info(`[${account.accountId}] CSP handshake complete — ready to send/receive`);
       });
 
+      client.on("reflectionQueueDry", () => {
+        markAccountReflectionQueueDry(account.accountId);
+        ctx.log?.info(`[${account.accountId}] Reflection queue dry — startup replay guard released`);
+      });
+
       return {
         stop: () => {
           stopped = true;
@@ -2825,6 +3318,8 @@ export const threemaPlugin: ChannelPlugin<ResolvedThreemaAccount> = {
           });
           client.disconnect();
           activeClients.delete(account.accountId);
+          flushSentMessageDedupeState(account.accountId, ctx);
+          accountInboundGuardStates.delete(account.accountId);
           ctx.log?.info(`[${account.accountId}] Threema provider stopped`);
         },
       };
@@ -3077,7 +3572,11 @@ async function processTextMessage(params: ProcessTextMessageParams) {
           nextGroupText,
           { requireCsp: true },
         );
-        trackSentMessage(anchorMessageId.toString());
+        trackSentMessage(anchorMessageId.toString(), {
+          accountId: account.accountId,
+          dataDir: account.dataDir,
+          ctx,
+        });
         groupEvolvingReplySessions.set(groupEvolvingSessionKey, {
           anchorMessageId,
           lastText: nextGroupText,
@@ -3106,7 +3605,11 @@ async function processTextMessage(params: ProcessTextMessageParams) {
           nextGroupText,
           { requireCsp: true },
         );
-        trackSentMessage(editMessageId.toString());
+        trackSentMessage(editMessageId.toString(), {
+          accountId: account.accountId,
+          dataDir: account.dataDir,
+          ctx,
+        });
         existingSession.lastText = nextGroupText;
         existingSession.updatedAt = Date.now();
         ctx.log?.info?.(
@@ -3124,7 +3627,11 @@ async function processTextMessage(params: ProcessTextMessageParams) {
           nextGroupText,
           { requireCsp: true },
         );
-        trackSentMessage(fallbackAnchorId.toString());
+        trackSentMessage(fallbackAnchorId.toString(), {
+          accountId: account.accountId,
+          dataDir: account.dataDir,
+          ctx,
+        });
         existingSession.anchorMessageId = fallbackAnchorId;
         existingSession.lastText = nextGroupText;
         existingSession.updatedAt = Date.now();
@@ -3229,7 +3736,11 @@ async function processTextMessage(params: ProcessTextMessageParams) {
                   },
                 });
               }
-              trackSentMessage(mediaSentId.toString());
+              trackSentMessage(mediaSentId.toString(), {
+                accountId: account.accountId,
+                dataDir: account.dataDir,
+                ctx,
+              });
               if (!mediaInstruction.sendTextAlso) {
                 return;
               }
@@ -3331,7 +3842,11 @@ async function processTextMessage(params: ProcessTextMessageParams) {
                       },
                     });
                   }
-                  trackSentMessage(mediaSentId.toString());
+                  trackSentMessage(mediaSentId.toString(), {
+                    accountId: account.accountId,
+                    dataDir: account.dataDir,
+                    ctx,
+                  });
                   if (!voiceInstruction.sendTextAlso) {
                     return;
                   }
@@ -3392,9 +3907,22 @@ async function processTextMessage(params: ProcessTextMessageParams) {
             if (!directFinalText.trim()) {
               return;
             }
+            if (shouldBlockDirectAutoReplyDueToCsp({
+              accountId: account.accountId,
+              cfg,
+              client,
+              chatId,
+              ctx,
+            })) {
+              return;
+            }
             sentId = await client.sendTextMessage(senderIdentity, directFinalText);
           }
-          trackSentMessage(sentId.toString());
+          trackSentMessage(sentId.toString(), {
+            accountId: account.accountId,
+            dataDir: account.dataDir,
+            ctx,
+          });
         },
         onError: (err: any, info: any) => {
           ctx.log?.error(`Threema ${info.kind} reply failed: ${String(err)}`);
@@ -4337,6 +4865,12 @@ async function handleInboundEnvelope(params: {
   ctx: any;
 }) {
   const { envelope, account, runtime, ctx } = params;
+  const cfg = runtime.config.loadConfig();
+  syncAccountInboundGuardSettings({
+    accountId: account.accountId,
+    cfg,
+  });
+  const reflectedOutgoingSettings = resolveProcessReflectedOutgoingConfig(cfg, account.accountId);
 
   // Handle incoming messages (from other people to us)
   if (envelope.incomingMessage) {
@@ -4386,6 +4920,18 @@ async function handleInboundEnvelope(params: {
         ctx,
         logPrefix: "Stored incoming",
       });
+      const reactionChatId = events[0]?.chatId ?? `threema:${senderIdentity}`;
+      const reactionMessageId = events[0]?.messageId ?? (msg.messageId?.toString?.() ?? `threema-${Date.now()}`);
+      if (!shouldForwardInboundToAgent({
+        accountId: account.accountId,
+        cfg,
+        chatId: reactionChatId,
+        messageId: reactionMessageId,
+        source: "incoming-reaction",
+        ctx,
+      })) {
+        return;
+      }
       await forwardReactionEventsToAgent({
         account,
         runtime,
@@ -4417,6 +4963,18 @@ async function handleInboundEnvelope(params: {
     }
 
     if (msg.type === THREEMA_FILE_MESSAGE_TYPE) {
+      const chatId = `threema:${senderIdentity}`;
+      const messageId = msg.messageId?.toString?.() ?? `threema-${Date.now()}`;
+      if (!shouldForwardInboundToAgent({
+        accountId: account.accountId,
+        cfg,
+        chatId,
+        messageId,
+        source: "incoming-file",
+        ctx,
+      })) {
+        return;
+      }
       await handleIncomingDirectFileMessage({
         msg,
         senderIdentity,
@@ -4428,6 +4986,18 @@ async function handleInboundEnvelope(params: {
     }
 
     if (msg.type === THREEMA_GROUP_FILE_MESSAGE_TYPE) {
+      const inferredChatId = `threema:group:${String(msg?.conversation?.group?.creatorIdentity ?? senderIdentity)}/${String(msg?.conversation?.group?.groupId ?? "unknown")}`;
+      const messageId = msg.messageId?.toString?.() ?? `threema-${Date.now()}`;
+      if (!shouldForwardInboundToAgent({
+        accountId: account.accountId,
+        cfg,
+        chatId: inferredChatId,
+        messageId,
+        source: "incoming-group-file",
+        ctx,
+      })) {
+        return;
+      }
       await handleIncomingGroupFileMessage({
         msg,
         senderIdentity,
@@ -4458,29 +5028,53 @@ async function handleInboundEnvelope(params: {
         accountId: account.accountId,
         ctx,
       });
+      const chatId = `threema:group:${creatorIdentity}/${gid}`;
+      const messageId = msg.messageId?.toString?.() ?? `threema-${Date.now()}`;
+      if (!shouldForwardInboundToAgent({
+        accountId: account.accountId,
+        cfg,
+        chatId,
+        messageId,
+        source: "incoming-group-text",
+        ctx,
+      })) {
+        return;
+      }
       await processTextMessage({
         text,
-        chatId: `threema:group:${creatorIdentity}/${gid}`,
+        chatId,
         chatType: "group",
         senderIdentity,
         conversationLabel,
         groupSubject: conversationLabel,
         groupCreator: creatorIdentity,
         groupIdBytes: new Uint8Array(groupIdBytes),
-        messageId: msg.messageId?.toString?.() ?? `threema-${Date.now()}`,
+        messageId,
         account,
         runtime,
         ctx,
       });
     } else {
       const text = msg.body ? new TextDecoder().decode(msg.body) : "";
+      const chatId = `threema:${senderIdentity}`;
+      const messageId = msg.messageId?.toString?.() ?? `threema-${Date.now()}`;
+      if (!shouldForwardInboundToAgent({
+        accountId: account.accountId,
+        cfg,
+        chatId,
+        messageId,
+        source: "incoming-text",
+        ctx,
+      })) {
+        return;
+      }
       await processTextMessage({
         text,
-        chatId: `threema:${senderIdentity}`,
+        chatId,
         chatType: "direct",
         senderIdentity,
         conversationLabel: senderIdentity,
-        messageId: msg.messageId?.toString?.() ?? `threema-${Date.now()}`,
+        messageId,
         account,
         runtime,
         ctx,
@@ -4493,9 +5087,26 @@ async function handleInboundEnvelope(params: {
   if (envelope.outgoingMessage) {
     const msg = envelope.outgoingMessage;
     const msgIdStr = msg.messageId?.toString?.() ?? "";
+    const outgoingChatId = resolveOutgoingMessageChatId({
+      msg,
+      account,
+    });
+
+    if (!reflectedOutgoingSettings.enabled) {
+      return;
+    }
+    if (reflectedOutgoingSettings.allowedChatIds.length > 0) {
+      if (!outgoingChatId || !reflectedOutgoingSettings.allowedChatIds.includes(outgoingChatId)) {
+        return;
+      }
+    }
 
     // Skip messages we sent ourselves (echo prevention)
-    if (msgIdStr && sentMessageIds.has(msgIdStr)) {
+    if (msgIdStr && hasTrackedSentMessage(msgIdStr, {
+      accountId: account.accountId,
+      dataDir: account.dataDir,
+      ctx,
+    })) {
       ctx.log?.debug?.(`[${account.accountId}] Skipping echo for message ${msgIdStr}`);
       return;
     }
@@ -4529,6 +5140,18 @@ async function handleInboundEnvelope(params: {
         ctx,
         logPrefix: "Stored outgoing",
       });
+      const reactionChatId = events[0]?.chatId ?? outgoingChatId ?? `threema:${account.identity?.identity ?? "unknown"}`;
+      const reactionMessageId = events[0]?.messageId ?? (msg.messageId?.toString?.() ?? `threema-${Date.now()}`);
+      if (!shouldForwardInboundToAgent({
+        accountId: account.accountId,
+        cfg,
+        chatId: reactionChatId,
+        messageId: reactionMessageId,
+        source: "outgoing-reaction",
+        ctx,
+      })) {
+        return;
+      }
       await forwardReactionEventsToAgent({
         account,
         runtime,
@@ -4581,6 +5204,17 @@ async function handleInboundEnvelope(params: {
       ctx.log?.info(
         `[${account.accountId}] 📩 Reflected outgoing group text in ${creatorIdentity}/${gid}: "${text.slice(0, 80)}"`,
       );
+      const messageId = msg.messageId?.toString?.() ?? `threema-${Date.now()}`;
+      if (!shouldForwardInboundToAgent({
+        accountId: account.accountId,
+        cfg,
+        chatId,
+        messageId,
+        source: "outgoing-group-text",
+        ctx,
+      })) {
+        return;
+      }
 
       // Route through OpenClaw as if it were an inbound message
       await processTextMessage({
@@ -4592,7 +5226,7 @@ async function handleInboundEnvelope(params: {
         groupSubject: conversationLabel,
         groupCreator: creatorIdentity,
         groupIdBytes: new Uint8Array(groupIdBytes),
-        messageId: msg.messageId?.toString?.() ?? `threema-${Date.now()}`,
+        messageId,
         account,
         runtime,
         ctx,

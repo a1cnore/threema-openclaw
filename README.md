@@ -121,6 +121,26 @@ Inbound:
 - Legacy receipt mapping handled where needed
 - Typing indicators are emitted and consumed
 
+### 5) Replay and reflection safety guards
+
+Defaults are now conservative to avoid replay-triggered reply loops:
+
+- `processReflectedOutgoing.enabled` defaults to `false`
+- `startupReplayGuard.enabled` defaults to `true`
+- inbound forwarding is delayed until `ReflectionQueueDry` (or warmup timeout)
+
+Enable reflected outgoing processing only for explicit chats:
+
+```bash
+openclaw config set --json channels.threema.features.processReflectedOutgoing '{"enabled": true, "allowedChatIds": ["threema:group:ABCD1234/1234567890"]}'
+```
+
+Tune startup replay guard:
+
+```bash
+openclaw config set --json channels.threema.features.startupReplayGuard '{"enabled": true, "requireReflectionQueueDry": true, "maxWarmupMs": 120000}'
+```
+
 ## Chat Target Formats
 
 Direct:
@@ -269,3 +289,12 @@ Run linking again:
 ```bash
 npx threema-openclaw link-device --data-dir "$THREEMA_DIR"
 ```
+
+### Large reflection replay or slot mismatch (`4115`)
+
+If logs show very large `queueLen` plus repeated `Device slot state mismatch`:
+
+1. Stop the gateway.
+2. Ensure this Mac uses its own linked `identity.json` (do not share another device's file).
+3. Relink this Mac and keep `identityFile`/`dataDir` consistent.
+4. Start again and wait for `Reflection queue dry` before testing automation flows.
