@@ -20,7 +20,7 @@ This repository currently provides:
 - Typing indicator send/receive handling
 - OpenClaw agent tools for group creation, media send, and reactions
 
-## install
+## Install
 
 ```bash
 npx --yes threema-openclaw@latest setup
