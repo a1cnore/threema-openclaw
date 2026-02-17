@@ -1,12 +1,25 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.join(__dirname, "..");
-const tsxCli = path.join(repoRoot, "node_modules", "tsx", "dist", "cli.mjs");
+const require = createRequire(import.meta.url);
+
+function resolveTsxCli() {
+  const localCandidate = path.join(repoRoot, "node_modules", "tsx", "dist", "cli.mjs");
+  try {
+    return require.resolve("tsx/cli");
+  } catch {
+    // Fall back to the local node_modules path for linked/local dev installs.
+    return localCandidate;
+  }
+}
+
+const tsxCli = resolveTsxCli();
 
 function printUsage() {
   console.log("threema-openclaw");

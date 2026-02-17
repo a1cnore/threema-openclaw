@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
+import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { resolveThreemaDataDir } from "./runtime-paths.js";
 
@@ -17,6 +18,7 @@ type SetupOptions = {
 };
 
 type SpawnResult = SpawnSyncReturns<string>;
+const require = createRequire(import.meta.url);
 
 function printUsage(): void {
   console.log("threema-openclaw setup");
@@ -149,10 +151,19 @@ function enablePlugin(pluginId: string): void {
   runCommand("openclaw", ["plugins", "enable", pluginId]);
 }
 
+function resolveTsxCli(repoRoot: string): string {
+  const localCandidate = path.join(repoRoot, "node_modules", "tsx", "dist", "cli.mjs");
+  try {
+    return require.resolve("tsx/cli");
+  } catch {
+    return localCandidate;
+  }
+}
+
 function runLinkDevice(dataDir: string): void {
   const srcDir = path.dirname(fileURLToPath(import.meta.url));
   const repoRoot = path.resolve(srcDir, "..");
-  const tsxCli = path.join(repoRoot, "node_modules", "tsx", "dist", "cli.mjs");
+  const tsxCli = resolveTsxCli(repoRoot);
   const linkScript = path.join(srcDir, "link-device.ts");
 
   if (!fs.existsSync(tsxCli)) {
