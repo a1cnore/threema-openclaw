@@ -1,7 +1,5 @@
 # Security and Cryptography Notes
 
-Audience: security auditors and cryptography professionals reviewing this repository.
-
 This document describes the current implementation in `threema-openclaw` and maps
 security claims to code. It is not a formal protocol specification.
 
