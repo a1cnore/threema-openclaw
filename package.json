@@ -1,0 +1,65 @@
+{
+  "name": "threema-openclaw",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Threema channel plugin for OpenClaw",
+  "license": "MIT",
+  "keywords": [
+    "openclaw",
+    "threema",
+    "plugin",
+    "channel"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "openclaw": {
+    "extensions": [
+      "./plugin.ts"
+    ]
+  },
+  "bin": {
+    "threema-openclaw": "./bin/cli.mjs"
+  },
+  "files": [
+    "bin",
+    "src",
+    "proto",
+    "plugin.ts",
+    "openclaw.plugin.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "cli": "node ./bin/cli.mjs",
+    "link-device": "tsx src/link-device.ts",
+    "connect-mediator": "tsx src/connect-mediator.ts",
+    "test-proto": "tsx tests/integration/test-proto.ts",
+    "test-create-group": "tsx tests/integration/test-create-group.ts",
+    "test-send-reflect": "tsx tests/integration/test-send.ts",
+    "test-send": "tsx tests/integration/test-send-dm.ts",
+    "test-send-media": "tsx tests/integration/test-send-media.ts",
+    "test-group-media": "tsx tests/integration/test-send-group-media.ts",
+    "test-send-to-group": "tsx tests/integration/test-send-to-group.ts",
+    "test-group-e2e": "tsx tests/integration/test-group-session-e2e.ts",
+    "test-group-evolving": "tsx tests/integration/test-group-evolving.ts",
+    "test:integration": "npm run test-proto && npm run test-create-group && npm run test-send-reflect && npm run test-send && npm run test-send-media && npm run test-group-media && npm run test-send-to-group && npm run test-group-e2e && npm run test-group-evolving",
+    "test:reflected-ack": "tsx --test tests/unit/mediator-client.reflected-ack.test.ts",
+    "test-reactions": "tsx tests/unit/test-reactions.ts"
+  },
+  "dependencies": {
+    "@noble/ciphers": "^2.1.1",
+    "@noble/curves": "^2.0.1",
+    "@noble/hashes": "^2.0.1",
+    "long": "^5.3.2",
+    "protobufjs": "^7.5.4",
+    "qrcode-terminal": "^0.12.0",
+    "tsx": "^4.19.0",
+    "ws": "^8.19.0"
+  },
+  "devDependencies": {
+    "@types/qrcode-terminal": "^0.12.2",
+    "@types/ws": "^8.18.1",
+    "typescript": "^5.6.0"
+  }
+}
