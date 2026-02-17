@@ -1,6 +1,7 @@
 #!/usr/bin/env tsx
 
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -25,12 +26,17 @@ function printUsage(): void {
   console.log("");
   console.log("Options:");
   console.log("  --data-dir <path>       Directory for identity.json/contacts.json/groups.json");
+  console.log("                          (default: ~/.openclaw/channels/threema/default)");
   console.log("  --account <id>          OpenClaw account id to configure (default: default)");
   console.log("  --plugin-spec <spec>    Plugin npm spec to install when missing");
   console.log("                          (default: threema-openclaw@latest)");
   console.log("  --skip-link             Skip QR linking (requires existing identity.json)");
   console.log("  --non-interactive       Fail if interactive linking would be required");
   console.log("  -h, --help              Show this help");
+}
+
+function defaultSetupDataDir(): string {
+  return path.join(os.homedir(), ".openclaw", "channels", "threema", "default");
 }
 
 function fail(message: string): never {
@@ -181,6 +187,18 @@ function verifyPlugin(pluginId: string): void {
   runCommand("openclaw", ["plugins", "info", pluginId]);
 }
 
+function readLinkedIdentity(identityPath: string): string | null {
+  try {
+    const raw = fs.readFileSync(identityPath, "utf8");
+    const parsed = JSON.parse(raw) as { identity?: unknown };
+    return typeof parsed.identity === "string" && parsed.identity.trim().length > 0
+      ? parsed.identity
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 function main(): void {
   const options = parseArgs(process.argv.slice(2));
   if (options.help) {
@@ -194,6 +212,8 @@ function main(): void {
 
   if (options.dataDirOverride) {
     process.env.THREEMA_DATA_DIR = path.resolve(process.cwd(), options.dataDirOverride);
+  } else if (!process.env.THREEMA_DATA_DIR?.trim()) {
+    process.env.THREEMA_DATA_DIR = defaultSetupDataDir();
   }
 
   const dataDir = resolveThreemaDataDir();
@@ -232,6 +252,10 @@ function main(): void {
   console.log("");
   console.log("Setup complete.");
   console.log(`Account: ${options.account}`);
+  const linkedIdentity = readLinkedIdentity(identityPath);
+  if (linkedIdentity) {
+    console.log(`Linked Threema ID: ${linkedIdentity}`);
+  }
   console.log(`Identity file: ${identityPath}`);
   console.log(`Data directory: ${dataDir}`);
 }

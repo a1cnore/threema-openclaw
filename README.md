@@ -25,17 +25,25 @@ This repository currently provides:
 ### 1) One command install + setup (no clone)
 
 ```bash
-bash -lc 'set -euo pipefail; THREEMA_DIR="${THREEMA_DIR:-$HOME/.openclaw/channels/threema/default}"; openclaw plugins install threema-openclaw@latest; openclaw plugins enable threema-openclaw; npx --yes threema-openclaw@latest setup --data-dir "$THREEMA_DIR" --account default'
+npx --yes threema-openclaw@latest setup
 ```
 
 What this command does:
 
 - Installs/enables the plugin from npm
 - Starts interactive Threema linking (QR scan) if `identity.json` is missing
+- Automatically creates `~/.openclaw/channels/threema/default` if needed
 - Writes OpenClaw account config for `identityFile` and `dataDir`
 - Runs plugin health checks
 
 You can safely run setup again. Existing linked identity data is reused unless you relink.
+
+How Threema ID linking works:
+
+- During QR linking, the phone shares device identity material and your Threema ID.
+- The plugin stores that in `identity.json`.
+- Setup binds your OpenClaw account (default: `channels.threema.accounts.default`) to that identity file path.
+- Result: that OpenClaw account uses the linked Threema ID for send/receive.
 
 ### 2) Verify load status
 
@@ -162,7 +170,7 @@ Supported commands:
 - `link-device [--data-dir <path>]`
 - `connect-mediator [--data-dir <path>]`
 
-`--data-dir` sets `THREEMA_DATA_DIR` for the command.
+`--data-dir` sets `THREEMA_DATA_DIR` for the command. `setup` defaults to `~/.openclaw/channels/threema/default`.
 
 ## Useful Runtime Toggles
 

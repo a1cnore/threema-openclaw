@@ -2,7 +2,7 @@
   "id": "threema-openclaw",
   "name": "Threema OpenClaw",
   "description": "Threema messaging channel via multi-device desktop emulation",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "channels": ["threema"],
   "configSchema": {
     "type": "object",
