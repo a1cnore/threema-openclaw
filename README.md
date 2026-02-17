@@ -22,50 +22,29 @@ This repository currently provides:
 
 ## Quick Start
 
-### 1) Clone and install
+### 1) One command install + setup (no clone)
 
 ```bash
-git clone https://github.com/a1cnore/threema-openclaw.git
-cd threema-openclaw
-npm install
+bash -lc 'set -euo pipefail; THREEMA_DIR="${THREEMA_DIR:-$HOME/.openclaw/channels/threema/default}"; openclaw plugins install threema-openclaw@latest; openclaw plugins enable threema-openclaw; npx --yes threema-openclaw@latest setup --data-dir "$THREEMA_DIR" --account default'
 ```
 
-### 2) Install plugin into OpenClaw
+What this command does:
 
-```bash
-openclaw plugins install . --link
-openclaw plugins enable threema-openclaw
-```
+- Installs/enables the plugin from npm
+- Starts interactive Threema linking (QR scan) if `identity.json` is missing
+- Writes OpenClaw account config for `identityFile` and `dataDir`
+- Runs plugin health checks
 
-If your gateway is already running, restart it so the plugin loads.
+You can safely run setup again. Existing linked identity data is reused unless you relink.
 
-### 3) Link a Threema device
-
-```bash
-export THREEMA_DIR="$HOME/.openclaw/channels/threema/default"
-mkdir -p "$THREEMA_DIR"
-npx threema-openclaw link-device --data-dir "$THREEMA_DIR"
-```
-
-This writes:
-
-- `identity.json`
-- `contacts.json`
-- `groups.json` (if groups exist)
-
-### 4) Configure account paths
-
-```bash
-openclaw config set channels.threema.accounts.default.identityFile "$THREEMA_DIR/identity.json"
-openclaw config set channels.threema.accounts.default.dataDir "$THREEMA_DIR"
-```
-
-### 5) Verify load status
+### 2) Verify load status
 
 ```bash
 openclaw plugins doctor
 openclaw plugins info threema-openclaw
 ```
+
+If your gateway is already running, restart it so the plugin loads.
 
 ## Nifty Features
 
@@ -165,14 +144,21 @@ The plugin exposes:
 
 ## CLI Commands
 
+No-clone usage:
+
+```bash
+npx --yes threema-openclaw@latest <command>
+```
+
 From this repo (after `npm install`):
 
 ```bash
-npx threema-openclaw <command>
+npm run cli -- <command>
 ```
 
 Supported commands:
 
+- `setup [--data-dir <path>] [--account <id>] [--skip-link] [--non-interactive]`
 - `link-device [--data-dir <path>]`
 - `connect-mediator [--data-dir <path>]`
 

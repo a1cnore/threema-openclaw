@@ -32,8 +32,10 @@
   ],
   "scripts": {
     "cli": "node ./bin/cli.mjs",
+    "setup": "tsx src/setup.ts",
     "link-device": "tsx src/link-device.ts",
     "connect-mediator": "tsx src/connect-mediator.ts",
+    "check:plugin-version": "node ./bin/check-plugin-version.mjs",
     "test-proto": "tsx tests/integration/test-proto.ts",
     "test-create-group": "tsx tests/integration/test-create-group.ts",
     "test-send-reflect": "tsx tests/integration/test-send.ts",

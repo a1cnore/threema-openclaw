@@ -14,6 +14,7 @@ function printUsage() {
   console.log("Usage:");
   console.log("  threema-openclaw link-device [--data-dir <path>]");
   console.log("  threema-openclaw connect-mediator [--data-dir <path>]");
+  console.log("  threema-openclaw setup [--data-dir <path>] [--account <id>] [--skip-link]");
   console.log("");
   console.log("Environment:");
   console.log("  THREEMA_DATA_DIR   Directory for identity.json/contacts.json/groups.json");
@@ -25,7 +26,12 @@ function parseDataDir(args) {
   for (let i = 0; i < args.length; i += 1) {
     const value = args[i];
     if (value === "--data-dir") {
-      dataDir = args[i + 1];
+      const maybePath = args[i + 1];
+      if (!maybePath || maybePath.startsWith("--")) {
+        console.error("Missing value for --data-dir");
+        process.exit(1);
+      }
+      dataDir = maybePath;
       i += 1;
       continue;
     }
@@ -44,6 +50,7 @@ if (command === "help" || command === "--help" || command === "-h") {
 const scriptsByCommand = {
   "link-device": path.join(repoRoot, "src", "link-device.ts"),
   "connect-mediator": path.join(repoRoot, "src", "connect-mediator.ts"),
+  "setup": path.join(repoRoot, "src", "setup.ts"),
 };
 
 const script = scriptsByCommand[command];
